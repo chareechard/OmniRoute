@@ -1,19 +1,27 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { quoteClaudeArgs, resolveClaudeSpawn } from "../../../bin/cli/commands/launch.mjs";
+import {
+  quoteClaudeArgs,
+  resolveClaudeSpawn,
+  resolveClaudeSpawnPlan,
+} from "../../../bin/cli/commands/launch.mjs";
 
 const isWindows = process.platform === "win32";
 
-// Regression guard for #8246: on Windows the `claude` binary is an npm `.cmd`
-// shim that spawn() cannot resolve without a shell (bare "claude" -> ENOENT).
-test("resolveClaudeSpawn: win32 spawns claude.cmd through a shell", () => {
+// Regression guard for #8246: on Windows an npm-installed `claude` is a `.cmd`
+// shim that spawn() cannot resolve without a shell (bare "claude" -> ENOENT
+// when shell is undefined). A native/standalone Claude Code install instead
+// places a bare `claude.exe` on PATH with no `.cmd` shim at all, so the
+// command must NOT be hardcoded to "claude.cmd" -- shell: true lets cmd.exe's
+// normal PATHEXT resolution find whichever one is actually installed.
+test("resolveClaudeSpawn: win32 spawns bare claude through a shell (PATHEXT resolves .cmd or .exe)", () => {
   const { command, shell } = resolveClaudeSpawn("win32");
-  assert.equal(command, "claude.cmd");
+  assert.equal(command, "claude");
   assert.equal(shell, true);
 });
 
@@ -117,6 +125,103 @@ test(
       });
 
       assert.deepEqual(received, args, "child argv must match what the caller passed");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+);
+
+// Bug found while validating the .cmd -> bare-command fix above: winShellArgs'
+// double caret-escaping assumes the target is ALWAYS an npm .cmd shim (two
+// cmd.exe parses). A native/standalone claude.exe install is only ONE parse
+// (cmd.exe hands the line straight to CreateProcess), so that same escaping
+// leaves literal stray carets in the args claude receives.
+// resolveClaudeSpawnPlan() is the fix: resolve "claude" via PATH first, and
+// only take the shell:true/escaped path when it actually resolves to a
+// .cmd/.bat.
+test("resolveClaudeSpawnPlan: falls back to the shell path when claude isn't a native exe", () => {
+  const dir = mkdtempSync(join(tmpdir(), "claude-plan-fallback-"));
+  try {
+    const args = ["-p", "two words"];
+    const plan = resolveClaudeSpawnPlan(args, "win32", { path: dir, pathExt: ".COM;.EXE;.BAT;.CMD" });
+    assert.equal(plan.command, "claude");
+    assert.equal(plan.shell, true);
+    assert.deepEqual(plan.args, quoteClaudeArgs(args, "win32"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveClaudeSpawnPlan: takes the direct no-shell path when claude is a native exe", () => {
+  const dir = mkdtempSync(join(tmpdir(), "claude-plan-native-"));
+  try {
+    writeFileSync(join(dir, "claude.exe"), "");
+    const args = ["-p", "two words"];
+    const plan = resolveClaudeSpawnPlan(args, "win32", { path: dir, pathExt: ".COM;.EXE;.BAT;.CMD" });
+    assert.equal(plan.command, join(dir, "claude.exe"));
+    assert.equal(plan.shell, false);
+    assert.deepEqual(plan.args, args, "raw argv, untouched by any cmd.exe escaping");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveClaudeSpawnPlan: non-Windows platforms never take the native-exe path", () => {
+  const args = ["-p", "two words"];
+  for (const platform of ["linux", "darwin"]) {
+    const plan = resolveClaudeSpawnPlan(args, platform);
+    assert.equal(plan.command, "claude");
+    assert.equal(plan.shell, undefined);
+    assert.deepEqual(plan.args, args);
+  }
+});
+
+// The real contract for the native-exe path: args reach the child completely
+// unescaped (no shell involved at all), proving the over-escaping bug is gone.
+// The node binary itself, copied to "claude.exe", stands in for a real
+// standalone Claude Code install -- both are plain native Windows binaries
+// resolved via PATH, which is the only thing resolveClaudeSpawnPlan cares about.
+test(
+  "resolveClaudeSpawnPlan: native-exe path delivers argv byte-identical (no cmd.exe involved)",
+  { skip: isWindows ? false : "windows-only: exercises the native-exe spawn path" },
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omniroute-claude-native-argv-"));
+    try {
+      writeFileSync(join(dir, "argv.mjs"), "console.log(JSON.stringify(process.argv.slice(1)));\n");
+      copyFileSync(process.execPath, join(dir, "claude.exe"));
+
+      const args = [
+        join(dir, "argv.mjs"),
+        "-p",
+        "In one short line: say BANANA",
+        "--append-system-prompt",
+        'quotes " and & ampersands | pipes',
+        "percent %PATH% and caret ^ and bang !",
+        "--profile",
+        "auto-best-coding",
+      ];
+
+      const plan = resolveClaudeSpawnPlan(args, "win32", {
+        path: dir,
+        pathExt: ".COM;.EXE;.BAT;.CMD",
+      });
+      assert.equal(plan.shell, false, "must take the no-shell native path for this probe");
+
+      const received = await new Promise<string[]>((resolve, reject) => {
+        const child = spawn(plan.command, plan.args, { shell: plan.shell, windowsHide: true });
+        let out = "";
+        child.stdout.on("data", (c) => (out += c));
+        child.on("error", reject);
+        child.on("exit", () => {
+          try {
+            resolve(JSON.parse(out.trim().split(/\r?\n/).pop() ?? "[]"));
+          } catch (err) {
+            reject(new Error(`probe did not emit argv JSON: ${out}`, { cause: err }));
+          }
+        });
+      });
+
+      assert.deepEqual(received, args, "child argv must match what the caller passed, unescaped");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

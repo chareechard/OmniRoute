@@ -3,7 +3,7 @@ import { join } from "node:path";
 import os from "node:os";
 import { t } from "../i18n.mjs";
 import { resolveActiveContext } from "../contexts.mjs";
-import { quoteShellArgs } from "../utils/winShellArgs.mjs";
+import { quoteShellArgs, resolveNativeWindowsBinary } from "../utils/winShellArgs.mjs";
 
 function stripTrailingSlash(value) {
   let s = String(value);
@@ -96,12 +96,18 @@ export function resolveLaunchTarget(opts = {}) {
  * shell cannot resolve PATHEXT shims (and Node refuses to exec `.cmd` directly
  * since CVE-2024-27980), so the Windows path must go through cmd.exe.
  *
+ * Deliberately no hardcoded extension here: a native/standalone Claude Code
+ * install places `claude.exe` on PATH with no `.cmd` shim at all, so pinning
+ * to "claude.cmd" breaks that install method. Passing the bare "claude"
+ * through cmd.exe (shell: true) lets normal PATHEXT resolution find whichever
+ * one the user actually has -- .cmd shim or .exe native binary.
+ *
  * @param {NodeJS.Platform|string} platform
  * @returns {{ command: string, shell: true|undefined }}
  */
 export function resolveClaudeSpawn(platform) {
   return platform === "win32"
-    ? { command: "claude.cmd", shell: true }
+    ? { command: "claude", shell: true }
     : { command: "claude", shell: undefined };
 }
 
@@ -117,6 +123,34 @@ export function resolveClaudeSpawn(platform) {
  */
 export function quoteClaudeArgs(args, platform) {
   return quoteShellArgs(args, platform);
+}
+
+/**
+ * Full spawn plan for the claude child: which binary to exec, whether to go
+ * through a shell, and the (possibly escaped) argv.
+ *
+ * On win32, when "claude" resolves to a native `.exe`/`.com` on PATH, spawn it
+ * directly (`shell:false`, raw argv) -- that skips cmd.exe entirely, so none
+ * of winShellArgs.mjs's caret-escaping applies (Node's own Windows argv
+ * encoding is already correct for a direct, non-shell spawn; escaping it too
+ * would leave literal stray carets in the args claude receives). Otherwise (a
+ * `.cmd`/`.bat` npm shim, or nothing resolvable at all) this keeps the
+ * existing `shell:true` + double-escaped-argv path unchanged.
+ *
+ * @param {string[]} claudeArgs
+ * @param {NodeJS.Platform|string} [platform]
+ * @param {{ path?: string, pathExt?: string }} [envOverride]  test seam, forwarded to resolveNativeWindowsBinary
+ * @returns {{ command:string, args:string[], shell:boolean|undefined }}
+ */
+export function resolveClaudeSpawnPlan(claudeArgs, platform = process.platform, envOverride = {}) {
+  if (platform === "win32") {
+    const nativePath = resolveNativeWindowsBinary("claude", envOverride);
+    if (nativePath) {
+      return { command: nativePath, args: claudeArgs, shell: false };
+    }
+  }
+  const { command, shell } = resolveClaudeSpawn(platform);
+  return { command, args: quoteClaudeArgs(claudeArgs, platform), shell };
 }
 
 /**
@@ -149,8 +183,8 @@ export async function runLaunchCommand(opts = {}, claudeArgs = []) {
   const env = buildClaudeEnv(process.env, baseUrl, authToken, { configDir });
 
   return await new Promise((resolve) => {
-    const { command, shell } = resolveClaudeSpawn(process.platform);
-    const child = spawn(command, quoteClaudeArgs(claudeArgs, process.platform), {
+    const { command, args: spawnArgs, shell } = resolveClaudeSpawnPlan(claudeArgs, process.platform);
+    const child = spawn(command, spawnArgs, {
       env,
       stdio: "inherit",
       shell,

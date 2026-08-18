@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -9,6 +9,7 @@ import {
   buildCodexProviderArgs,
   quoteCodexArgs,
   resolveCodexSpawn,
+  resolveCodexSpawnPlan,
 } from "../../../bin/cli/commands/launch-codex.mjs";
 
 const isWindows = process.platform === "win32";
@@ -128,6 +129,102 @@ test(
       });
 
       assert.deepEqual(received, args, "child argv must match what the caller passed");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+);
+
+// Bug found while validating the .cmd -> bare-command fix above: winShellArgs'
+// double caret-escaping assumes the target is ALWAYS an npm .cmd shim (two
+// cmd.exe parses). A native/standalone codex.exe install is only ONE parse
+// (cmd.exe hands the line straight to CreateProcess), so that same escaping
+// leaves literal stray carets in the args codex receives -- reproduced live
+// against node.exe: `error: unexpected argument '^model_provider=\^omniroute\^^'`.
+// resolveCodexSpawnPlan() is the fix: resolve "codex" via PATH first, and only
+// take the shell:true/escaped path when it actually resolves to a .cmd/.bat.
+test("resolveCodexSpawnPlan: falls back to the shell path when codex isn't a native exe", () => {
+  const dir = mkdtempSync(join(tmpdir(), "codex-plan-fallback-"));
+  try {
+    // empty dir on PATH: resolveNativeWindowsBinary finds nothing native.
+    const args = buildCodexProviderArgs("http://localhost:20128");
+    const plan = resolveCodexSpawnPlan(args, "win32", { path: dir, pathExt: ".COM;.EXE;.BAT;.CMD" });
+    assert.equal(plan.command, "codex");
+    assert.equal(plan.shell, true);
+    assert.deepEqual(plan.args, quoteCodexArgs(args, "win32"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveCodexSpawnPlan: takes the direct no-shell path when codex is a native exe", () => {
+  const dir = mkdtempSync(join(tmpdir(), "codex-plan-native-"));
+  try {
+    writeFileSync(join(dir, "codex.exe"), "");
+    const args = buildCodexProviderArgs("http://localhost:20128");
+    const plan = resolveCodexSpawnPlan(args, "win32", { path: dir, pathExt: ".COM;.EXE;.BAT;.CMD" });
+    assert.equal(plan.command, join(dir, "codex.exe"));
+    assert.equal(plan.shell, false);
+    assert.deepEqual(plan.args, args, "raw argv, untouched by any cmd.exe escaping");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveCodexSpawnPlan: non-Windows platforms never take the native-exe path", () => {
+  const args = buildCodexProviderArgs("http://localhost:20128");
+  for (const platform of ["linux", "darwin"]) {
+    const plan = resolveCodexSpawnPlan(args, platform);
+    assert.equal(plan.command, "codex");
+    assert.equal(plan.shell, undefined);
+    assert.deepEqual(plan.args, args);
+  }
+});
+
+// The real contract for the native-exe path: args reach the child completely
+// unescaped (no shell involved at all), proving the over-escaping bug is gone.
+// The node binary itself, copied to "codex.exe", stands in for a real
+// standalone codex install -- both are plain native Windows binaries resolved
+// via PATH, which is the only thing resolveCodexSpawnPlan cares about.
+test(
+  "resolveCodexSpawnPlan: native-exe path delivers argv byte-identical (no cmd.exe involved)",
+  { skip: isWindows ? false : "windows-only: exercises the native-exe spawn path" },
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omniroute-codex-native-argv-"));
+    try {
+      writeFileSync(join(dir, "argv.mjs"), "console.log(JSON.stringify(process.argv.slice(1)));\n");
+      copyFileSync(process.execPath, join(dir, "codex.exe"));
+
+      const args = [
+        join(dir, "argv.mjs"),
+        ...buildCodexProviderArgs("http://localhost:20128"),
+        "--profile",
+        "auto-best-coding",
+        'quotes " and & ampersands | pipes',
+        "percent %PATH% and caret ^ and bang !",
+      ];
+
+      const plan = resolveCodexSpawnPlan(args, "win32", {
+        path: dir,
+        pathExt: ".COM;.EXE;.BAT;.CMD",
+      });
+      assert.equal(plan.shell, false, "must take the no-shell native path for this probe");
+
+      const received = await new Promise<string[]>((resolve, reject) => {
+        const child = spawn(plan.command, plan.args, { shell: plan.shell, windowsHide: true });
+        let out = "";
+        child.stdout.on("data", (c) => (out += c));
+        child.on("error", reject);
+        child.on("exit", () => {
+          try {
+            resolve(JSON.parse(out.trim().split(/\r?\n/).pop() ?? "[]"));
+          } catch (err) {
+            reject(new Error(`probe did not emit argv JSON: ${out}`, { cause: err }));
+          }
+        });
+      });
+
+      assert.deepEqual(received, args, "child argv must match what the caller passed, unescaped");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

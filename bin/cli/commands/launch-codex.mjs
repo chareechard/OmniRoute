@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { t } from "../i18n.mjs";
 import { resolveActiveContext } from "../contexts.mjs";
-import { quoteShellArgs } from "../utils/winShellArgs.mjs";
+import { quoteShellArgs, resolveNativeWindowsBinary } from "../utils/winShellArgs.mjs";
 
 /** OpenAI/Codex env keys stripped from the child so a stale OpenAI key/base-url
  *  in the shell can't shadow the omniroute provider (defense-in-depth). Mirrors
@@ -149,6 +149,34 @@ export function buildCodexProviderArgs(baseUrl) {
 }
 
 /**
+ * Full spawn plan for the codex child: which binary to exec, whether to go
+ * through a shell, and the (possibly escaped) argv.
+ *
+ * On win32, when "codex" resolves to a native `.exe`/`.com` on PATH, spawn it
+ * directly (`shell:false`, raw argv) -- that skips cmd.exe entirely, so none
+ * of winShellArgs.mjs's caret-escaping applies (Node's own Windows argv
+ * encoding is already correct for a direct, non-shell spawn; escaping it too
+ * would leave literal stray carets in the args codex receives). Otherwise (a
+ * `.cmd`/`.bat` npm shim, or nothing resolvable at all) this keeps the
+ * existing `shell:true` + double-escaped-argv path unchanged.
+ *
+ * @param {string[]} extraArgs
+ * @param {NodeJS.Platform|string} [platform]
+ * @param {{ path?: string, pathExt?: string }} [envOverride]  test seam, forwarded to resolveNativeWindowsBinary
+ * @returns {{ command:string, args:string[], shell:boolean|undefined }}
+ */
+export function resolveCodexSpawnPlan(extraArgs, platform = process.platform, envOverride = {}) {
+  if (platform === "win32") {
+    const nativePath = resolveNativeWindowsBinary("codex", envOverride);
+    if (nativePath) {
+      return { command: nativePath, args: extraArgs, shell: false };
+    }
+  }
+  const { command, shell } = resolveCodexSpawn(platform);
+  return { command, args: quoteCodexArgs(extraArgs, platform), shell };
+}
+
+/**
  * @param {{port?:string, remote?:string, profile?:string, apiKey?:string}} opts
  * @param {string[]} codexArgs  pass-through args for the codex binary
  * @returns {Promise<number>} exit code
@@ -174,8 +202,12 @@ export async function runLaunchCodexCommand(opts = {}, codexArgs = []) {
   const env = buildCodexEnv(process.env, authToken);
 
   return await new Promise((resolve) => {
-    const { command: codexLaunch, shell: shellValue } = resolveCodexSpawn(process.platform);
-    const child = spawn(codexLaunch, quoteCodexArgs(extraArgs, process.platform), {
+    const {
+      command: codexLaunch,
+      args: spawnArgs,
+      shell: shellValue,
+    } = resolveCodexSpawnPlan(extraArgs, process.platform);
+    const child = spawn(codexLaunch, spawnArgs, {
       env,
       stdio: "inherit",
       shell: shellValue,
